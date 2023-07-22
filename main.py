@@ -1,4 +1,5 @@
 import chess
+import chess.pgn
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,31 +9,38 @@ from tqdm import tqdm
 import os
 
 # Set the device for GPU support
-device = torch.device("mps")
+# device = torch.device("mps")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Neural network definition
 class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
         self.conv1 = nn.Conv2d(19, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.conv5 = nn.Conv2d(256, 32, kernel_size=3, padding=1)
+        self.bn5 = nn.BatchNorm2d(32)
         self.fc_policy = nn.Linear(32 * 8 * 8, 64 * 2)
         self.fc_value = nn.Linear(32 * 8 * 8, 1)
 
     def forward(self, x, legal_moves=None):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = torch.relu(self.conv3(x))
-        x = torch.relu(self.conv4(x))
+        x = self.bn1(torch.relu(self.conv1(x)))
+        x = self.bn2(torch.relu(self.conv2(x)))
+        x = self.bn3(torch.relu(self.conv3(x)))
+        x = self.bn4(torch.relu(self.conv4(x)))
+        x = self.bn5(torch.relu(self.conv5(x)))
         policy = self.fc_policy(x.view(x.size(0), -1)).view(-1, 64 * 2)
         policy = torch.softmax(self.fc_policy(x.view(x.size(0), -1)).view(-1, 64 * 2), dim=1)
         if legal_moves is not None:
             policy = policy * legal_moves
         value = torch.tanh(self.fc_value(x.view(x.size(0), -1)))
         return policy, value
-
 
 # Prepare the board state for the neural network
 def board_to_tensor(board):
@@ -61,10 +69,15 @@ def legal_moves_to_tensor(board):
         legal_moves[move.to_square + 64] = 1
     return legal_moves
 
-# Self-play function for generating training data
-def self_play(network, games, optimizer, epsilon=0.1):
-    for _ in tqdm(range(games), desc="Self-play progress"):  # Add a progress bar here
+def self_play(network, games, optimizer, epsilon=0.1, learning_rate=0.01):
+    optimizer = optim.Adam(network.parameters(), lr=learning_rate)
+    network.eval()
+    best_loss = float("inf")
+    for i in tqdm(range(games), desc="Self-play progress"):
         board = chess.Board()
+        game = chess.pgn.Game()
+        game.headers["Event"] = "Self-play"
+        node = game
         board_states = []
         moves_from = []
         moves_to = []
@@ -73,26 +86,49 @@ def self_play(network, games, optimizer, epsilon=0.1):
         while not board.is_game_over():
             board_tensor = torch.from_numpy(board_to_tensor(board)).float().unsqueeze(0).to(device)
             legal_moves = torch.from_numpy(legal_moves_to_tensor(board)).float().unsqueeze(0).to(device)
-            policy, value = network(board_tensor, legal_moves)
+            with torch.no_grad():
+                policy, value = network(board_tensor, legal_moves)
 
             if random.random() < epsilon:
                 move = random.choice(list(board.legal_moves))
             else:
-                move = None
-                while move is None or move not in board.legal_moves:
-                    move_from = torch.multinomial(policy[0, :64] + 1e-8, 1).item()
-                    move_to = torch.multinomial(policy[0, 64:] + 1e-8, 1).item()
-                    move = chess.Move(move_from, move_to)
+                # Sort the moves by their probabilities
+                sorted_moves_from = torch.argsort(policy[0, :64], descending=True)
+                sorted_moves_to = torch.argsort(policy[0, 64:], descending=True)
 
+                # Select the highest-probability legal move
+                move = None
+                for move_from in sorted_moves_from:
+                    for move_to in sorted_moves_to:
+                        potential_move = chess.Move(move_from.item(), move_to.item())
+                        if potential_move in board.legal_moves:
+                            move = potential_move
+                            break
+                    if move is not None:
+                        break
+
+                # If no legal move was found (which should not happen if the policy is properly normalized),
+                # select a random legal move
+                if move is None:
+                    move = random.choice(list(board.legal_moves))
+
+            node = node.add_variation(move)
             board_states.append(board_tensor.squeeze(0))
             moves_from.append(move.from_square)
             moves_to.append(move.to_square)
             game_results.append(result_to_value(board.result()))
-
             board.push(move)
 
         loss = train(network, board_states, moves_from, moves_to, game_results, optimizer)
-        print(f'Loss: {loss}')
+        print(f'Loss after game {i+1}: {loss}')
+
+        # Save the best model and its games
+        if loss < best_loss:
+            best_loss = loss
+            save_model(network, 'best_model.pth')
+            with open("best_game.pgn", "w") as f:
+                print(game, file=f)
+
 
 
 # Training function
@@ -134,7 +170,6 @@ def result_to_value(result):
     else:
         return 0
 
-
 def play(network):
     board = chess.Board()
     while not board.is_game_over():
@@ -155,14 +190,11 @@ def play(network):
             board.push(move)
     print(board.result())
 
-
 def save_model(network, file_path='model.pth'):
     torch.save(network.state_dict(), file_path)
 
-
 def load_model(network, file_path='model.pth'):
     network.load_state_dict(torch.load(file_path))
-
 
 # Initialize the network and optimizer
 network = ChessNet().to(device)
@@ -173,7 +205,7 @@ if os.path.isfile('chess_model.pth'):
 optimizer = optim.Adam(network.parameters())
 
 # Self-play phase
-self_play(network, 100, optimizer)
+self_play(network, 100000, optimizer, learning_rate=0.001)
 
 # save the model
 save_model(network, 'chess_model.pth')
