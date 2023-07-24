@@ -9,38 +9,84 @@ from tqdm import tqdm
 import os
 
 # Set the device for GPU support
-# device = torch.device("mps")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("mps")
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Neural network definition
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=padding)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        if in_channels != out_channels:
+            self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual = nn.Identity()
+
+    def forward(self, x):
+        residual = self.residual(x)
+        x = self.bn1(torch.relu(self.conv1(x)))
+        x = self.bn2(torch.relu(self.conv2(x)))
+        return torch.relu(x + residual)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, in_channels, num_heads=8):
+        super(MultiHeadAttention, self).__init__()
+        self.in_channels = in_channels
+        self.num_heads = num_heads
+        self.head_channels = in_channels // num_heads
+        assert self.head_channels * num_heads == in_channels, "in_channels must be divisible by num_heads."
+
+        self.q_linear = nn.Linear(in_channels, in_channels)
+        self.k_linear = nn.Linear(in_channels, in_channels)
+        self.v_linear = nn.Linear(in_channels, in_channels)
+
+    def forward(self, x):
+        # Shape of x: [batch_size, seq_len, in_channels]
+        batch_size, seq_len, _ = x.size()
+
+        # Transform queries, keys, values
+        queries = self.q_linear(x).view(batch_size, seq_len, self.num_heads, self.head_channels).transpose(1, 2)
+        keys = self.k_linear(x).view(batch_size, seq_len, self.num_heads, self.head_channels).transpose(1, 2)
+        values = self.v_linear(x).view(batch_size, seq_len, self.num_heads, self.head_channels).transpose(1, 2)
+
+        # Compute scaled dot-product attention
+        attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / np.sqrt(self.head_channels)
+        attention_weights = torch.softmax(attention_scores, dim=-1)
+        attended_values = torch.matmul(attention_weights, values).transpose(1, 2).contiguous()
+        attended_values = attended_values.view(batch_size, seq_len, self.in_channels)
+
+        return attended_values
+
 class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
         self.conv1 = nn.Conv2d(19, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm2d(256)
-        self.conv5 = nn.Conv2d(256, 32, kernel_size=3, padding=1)
-        self.bn5 = nn.BatchNorm2d(32)
+        self.res1 = ResidualBlock(32, 64)
+        self.res2 = ResidualBlock(64, 128)
+        self.res3 = ResidualBlock(128, 256)
+        self.res4 = ResidualBlock(256, 32)
+        self.mha = MultiHeadAttention(32 * 8 * 8)
         self.fc_policy = nn.Linear(32 * 8 * 8, 64 * 2)
         self.fc_value = nn.Linear(32 * 8 * 8, 1)
 
     def forward(self, x, legal_moves=None):
         x = self.bn1(torch.relu(self.conv1(x)))
-        x = self.bn2(torch.relu(self.conv2(x)))
-        x = self.bn3(torch.relu(self.conv3(x)))
-        x = self.bn4(torch.relu(self.conv4(x)))
-        x = self.bn5(torch.relu(self.conv5(x)))
-        policy = self.fc_policy(x.view(x.size(0), -1)).view(-1, 64 * 2)
-        policy = torch.softmax(self.fc_policy(x.view(x.size(0), -1)).view(-1, 64 * 2), dim=1)
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.res3(x)
+        x = self.res4(x)
+        x = x.view(x.size(0), -1)  # flatten
+        x = self.mha(x.unsqueeze(1)).squeeze(1)  # apply multi-head attention
+        policy = torch.softmax(self.fc_policy(x), dim=1)
         if legal_moves is not None:
             policy = policy * legal_moves
-        value = torch.tanh(self.fc_value(x.view(x.size(0), -1)))
+        value = torch.tanh(self.fc_value(x))
         return policy, value
+
 
 # Prepare the board state for the neural network
 def board_to_tensor(board):
