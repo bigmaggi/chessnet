@@ -7,10 +7,13 @@ import numpy as np
 import random
 from tqdm import tqdm
 import os
+import chess.engine
+
 
 # Set the device for GPU support
-device = torch.device("mps")
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("mps")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # Neural network definition
 class ResidualBlock(nn.Module):
@@ -30,6 +33,7 @@ class ResidualBlock(nn.Module):
         x = self.bn1(torch.relu(self.conv1(x)))
         x = self.bn2(torch.relu(self.conv2(x)))
         return torch.relu(x + residual)
+
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, in_channels, num_heads=8):
@@ -60,6 +64,7 @@ class MultiHeadAttention(nn.Module):
 
         return attended_values
 
+
 class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
@@ -68,8 +73,10 @@ class ChessNet(nn.Module):
         self.res1 = ResidualBlock(32, 64)
         self.res2 = ResidualBlock(64, 128)
         self.res3 = ResidualBlock(128, 256)
-        self.res4 = ResidualBlock(256, 32)
-        self.mha = MultiHeadAttention(32 * 8 * 8)
+        self.res4 = ResidualBlock(256, 512)
+        self.res5 = ResidualBlock(512, 512)
+        self.res5 = ResidualBlock(512, 32)
+        self.mha = MultiHeadAttention(2048)  # or whatever the final output size of your ResidualBlock is
         self.fc_policy = nn.Linear(32 * 8 * 8, 64 * 2)
         self.fc_value = nn.Linear(32 * 8 * 8, 1)
 
@@ -79,6 +86,7 @@ class ChessNet(nn.Module):
         x = self.res2(x)
         x = self.res3(x)
         x = self.res4(x)
+        x = self.res5(x)
         x = x.view(x.size(0), -1)  # flatten
         x = self.mha(x.unsqueeze(1)).squeeze(1)  # apply multi-head attention
         policy = torch.softmax(self.fc_policy(x), dim=1)
@@ -114,6 +122,78 @@ def legal_moves_to_tensor(board):
         legal_moves[move.from_square] = 1
         legal_moves[move.to_square + 64] = 1
     return legal_moves
+
+
+# Play against Stockfish
+def play_vs_stockfish(network, engine_path, games, optimizer, learning_rate=0.01, timeout=0.1):
+    # Create a new chess engine instance
+    engine = chess.engine.SimpleEngine.popen_uci(engine_path)
+
+    optimizer = optim.Adam(network.parameters(), lr=learning_rate)
+    network.eval()
+    best_loss = float("inf")
+
+    for i in tqdm(range(games), desc="Play vs Stockfish progress"):
+        board = chess.Board()
+        game = chess.pgn.Game()
+        game.headers["Event"] = "Play vs Stockfish"
+        node = game
+        board_states = []
+        moves_from = []
+        moves_to = []
+        game_results = []
+
+        while not board.is_game_over():
+            if board.turn:  # AI's turn
+                board_tensor = torch.from_numpy(board_to_tensor(board)).float().unsqueeze(0).to(device)
+                legal_moves = torch.from_numpy(legal_moves_to_tensor(board)).float().unsqueeze(0).to(device)
+                with torch.no_grad():
+                    policy, value = network(board_tensor, legal_moves)
+
+                # Sort the moves by their probabilities
+                sorted_moves_from = torch.argsort(policy[0, :64], descending=True)
+                sorted_moves_to = torch.argsort(policy[0, 64:], descending=True)
+
+                # Select the highest-probability legal move
+                move = None
+                for move_from in sorted_moves_from:
+                    for move_to in sorted_moves_to:
+                        potential_move = chess.Move(move_from.item(), move_to.item())
+                        if potential_move in board.legal_moves:
+                            move = potential_move
+                            break
+                    if move is not None:
+                        break
+
+                # If no legal move was found (which should not happen if the policy is properly normalized),
+                # select a random legal move
+                if move is None:
+                    move = random.choice(list(board.legal_moves))
+
+            else:  # Stockfish's turn
+                result = engine.play(board, chess.engine.Limit(time=timeout))
+                move = result.move
+
+            node = node.add_variation(move)
+            board_states.append(board_tensor.squeeze(0))
+            moves_from.append(move.from_square)
+            moves_to.append(move.to_square)
+            game_results.append(result_to_value(board.result()))
+            board.push(move)
+
+        loss = train(network, board_states, moves_from, moves_to, game_results, optimizer)
+        print(f'Loss after game {i+1}: {loss}')
+
+        # Save the best model and its games
+        if loss < best_loss:
+            best_loss = loss
+            save_model(network, 'best_model.pth')
+            with open("best_game.pgn", "w") as f:
+                print(game, file=f)
+
+    # Close the engine after the games
+    engine.quit()
+
 
 def self_play(network, games, optimizer, epsilon=0.1, learning_rate=0.01):
     optimizer = optim.Adam(network.parameters(), lr=learning_rate)
@@ -251,7 +331,10 @@ if os.path.isfile('chess_model.pth'):
 optimizer = optim.Adam(network.parameters())
 
 # Self-play phase
-self_play(network, 100000, optimizer, learning_rate=0.001)
+# self_play(network, 100000, optimizer, learning_rate=0.001)
+
+# Play against Stockfisho
+play_vs_stockfish(network, 'stockfish/stockfish-ubuntu-x86-64-avx2', 1000, optimizer, learning_rate=0.0001)
 
 # save the model
 save_model(network, 'chess_model.pth')
